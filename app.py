@@ -25,86 +25,7 @@ ACTION_SITE_VISIT_END = "Site Visit End"
 ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "admin123")
 SHEET_URL = st.secrets.get("SHEET_URL", "")
 
-# Default employee credentials (username: password)
-DEFAULT_EMPLOYEE_CREDENTIALS = {
-    'alice': {'password': 'alice123', 'name': 'Alice'},
-    'bob': {'password': 'bob123', 'name': 'Bob'},
-    'charlie': {'password': 'charlie123', 'name': 'Charlie'},
-    'diana': {'password': 'diana123', 'name': 'Diana'},
-}
-
-
 # --- Functions ---
-
-def hash_password(password):
-    """Hash a password for secure storage."""
-    return hashlib.sha256(password.encode()).hexdigest()
-
-def get_employee_credentials():
-    """Get employee credentials from session state or use defaults."""
-    if 'employee_credentials' not in st.session_state:
-        # Store hashed passwords
-        st.session_state.employee_credentials = {}
-        for username, data in DEFAULT_EMPLOYEE_CREDENTIALS.items():
-            st.session_state.employee_credentials[username] = {
-                'password_hash': hash_password(data['password']),
-                'name': data['name']
-            }
-    return st.session_state.employee_credentials
-
-def get_employees():
-    """Get the list of employee names."""
-    credentials = get_employee_credentials()
-    return [data['name'] for data in credentials.values()]
-
-def authenticate_employee(username, password):
-    """Authenticate an employee by username and password."""
-    credentials = get_employee_credentials()
-    username_lower = username.lower().strip()
-    if username_lower in credentials:
-        if credentials[username_lower]['password_hash'] == hash_password(password):
-            return credentials[username_lower]['name']
-    return None
-
-def add_employee(username, password, display_name):
-    """Add a new employee with credentials."""
-    credentials = get_employee_credentials()
-    username_lower = username.lower().strip()
-    if username_lower in credentials:
-        return False, "Username already exists!"
-    if not username_lower or not password or not display_name:
-        return False, "All fields are required!"
-
-    st.session_state.employee_credentials[username_lower] = {
-        'password_hash': hash_password(password),
-        'name': display_name.strip()
-    }
-    return True, f"Employee {display_name} added successfully!"
-
-def remove_employee(username):
-    """Remove an employee."""
-    credentials = get_employee_credentials()
-    username_lower = username.lower().strip()
-    if username_lower in credentials:
-        del st.session_state.employee_credentials[username_lower]
-        return True, "Employee removed successfully!"
-    return False, "Employee not found!"
-
-def change_employee_password(username, new_password):
-    """Change an employee's password."""
-    credentials = get_employee_credentials()
-    username_lower = username.lower().strip()
-    if username_lower in credentials:
-        st.session_state.employee_credentials[username_lower]['password_hash'] = hash_password(new_password)
-        return True, "Password changed successfully!"
-    return False, "Employee not found!"
-
-def logout_employee():
-    """Log out the current employee."""
-    if 'logged_in_employee' in st.session_state:
-        del st.session_state.logged_in_employee
-    if 'logged_in_username' in st.session_state:
-        del st.session_state.logged_in_username
 
 @st.cache_resource
 def get_gsheet_client():
@@ -125,6 +46,140 @@ def retry_operation(operation, max_retries=3, delay=1):
             if attempt < max_retries - 1:
                 time_module.sleep(delay * (2 ** attempt))
     raise last_error
+
+def hash_password(password):
+    """Hash a password for secure storage."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def get_employees_worksheet():
+    """Get or create the Employees worksheet."""
+    client = get_gsheet_client()
+    sh = client.open_by_url(SHEET_URL)
+
+    # Try to get the Employees worksheet
+    try:
+        worksheet = sh.worksheet("Employees")
+    except gspread.exceptions.WorksheetNotFound:
+        # Create the worksheet with headers
+        worksheet = sh.add_worksheet(title="Employees", rows=100, cols=3)
+        worksheet.append_row(["Username", "PasswordHash", "DisplayName"])
+
+    return worksheet
+
+@st.cache_data(ttl=60)
+def load_employees_from_sheet():
+    """Load employee credentials from Google Sheets."""
+    def _load():
+        worksheet = get_employees_worksheet()
+        data = worksheet.get_all_records()
+        credentials = {}
+        for row in data:
+            username = row.get('Username', '').lower().strip()
+            if username:
+                credentials[username] = {
+                    'password_hash': row.get('PasswordHash', ''),
+                    'name': row.get('DisplayName', '')
+                }
+        return credentials
+
+    try:
+        return retry_operation(_load)
+    except Exception as e:
+        st.error(f"Failed to load employees: {e}")
+        return {}
+
+def clear_employees_cache():
+    """Clear the employees cache."""
+    load_employees_from_sheet.clear()
+
+def get_employee_credentials():
+    """Get employee credentials from Google Sheets."""
+    return load_employees_from_sheet()
+
+def get_employees():
+    """Get the list of employee names."""
+    credentials = get_employee_credentials()
+    return [data['name'] for data in credentials.values()]
+
+def authenticate_employee(username, password):
+    """Authenticate an employee by username and password."""
+    credentials = get_employee_credentials()
+    username_lower = username.lower().strip()
+    if username_lower in credentials:
+        if credentials[username_lower]['password_hash'] == hash_password(password):
+            return credentials[username_lower]['name']
+    return None
+
+def add_employee(username, password, display_name):
+    """Add a new employee to Google Sheets."""
+    credentials = get_employee_credentials()
+    username_lower = username.lower().strip()
+    if username_lower in credentials:
+        return False, "Username already exists!"
+    if not username_lower or not password or not display_name:
+        return False, "All fields are required!"
+
+    def _add():
+        worksheet = get_employees_worksheet()
+        password_hash = hash_password(password)
+        worksheet.append_row([username_lower, password_hash, display_name.strip()])
+
+    try:
+        retry_operation(_add)
+        clear_employees_cache()
+        return True, f"Employee {display_name} added successfully!"
+    except Exception as e:
+        return False, f"Failed to add employee: {e}"
+
+def remove_employee(username):
+    """Remove an employee from Google Sheets."""
+    credentials = get_employee_credentials()
+    username_lower = username.lower().strip()
+    if username_lower not in credentials:
+        return False, "Employee not found!"
+
+    def _remove():
+        worksheet = get_employees_worksheet()
+        # Find the row with this username
+        cell = worksheet.find(username_lower, in_column=1)
+        if cell:
+            worksheet.delete_rows(cell.row)
+
+    try:
+        retry_operation(_remove)
+        clear_employees_cache()
+        return True, "Employee removed successfully!"
+    except Exception as e:
+        return False, f"Failed to remove employee: {e}"
+
+def change_employee_password(username, new_password):
+    """Change an employee's password in Google Sheets."""
+    credentials = get_employee_credentials()
+    username_lower = username.lower().strip()
+    if username_lower not in credentials:
+        return False, "Employee not found!"
+
+    def _change():
+        worksheet = get_employees_worksheet()
+        # Find the row with this username
+        cell = worksheet.find(username_lower, in_column=1)
+        if cell:
+            # Update the password hash (column 2)
+            worksheet.update_cell(cell.row, 2, hash_password(new_password))
+
+    try:
+        retry_operation(_change)
+        clear_employees_cache()
+        return True, "Password changed successfully!"
+    except Exception as e:
+        return False, f"Failed to change password: {e}"
+
+def logout_employee():
+    """Log out the current employee."""
+    if 'logged_in_employee' in st.session_state:
+        del st.session_state.logged_in_employee
+    if 'logged_in_username' in st.session_state:
+        del st.session_state.logged_in_username
 
 @st.cache_data(ttl=60)
 def load_data():
@@ -514,6 +569,10 @@ if st.session_state.admin_logged_in:
             success, message = add_employee(new_username, new_password, new_display_name)
             if success:
                 st.success(message)
+                # Clear input fields
+                del st.session_state.new_username
+                del st.session_state.new_password
+                del st.session_state.new_display_name
                 st.rerun()
             else:
                 st.warning(message)
